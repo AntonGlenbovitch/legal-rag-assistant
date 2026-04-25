@@ -2,7 +2,7 @@
 
 This plan describes a production RAG/agent system built on AWS Bedrock as the foundation. Every primary technology choice is AWS-native and Bedrock-aligned, with explicit trade-offs against alternatives. It is structured to map directly onto the JD: S3-hosted KB, Bedrock models + Guardrails, Bedrock Agents/AgentCore, evaluations, observability, and IaC.
 
-The reference use case is a customer-facing assistant grounded in policy/coverage documents and capable of safe, audited tool use (e.g., look up coverage, check claim status). The same architecture generalizes to any enterprise document-grounded assistant.
+The reference use case is a customer-facing assistant grounded in policy/coverage documents and capable of safe, audited tool use (e.g., look up coverage, check claim status). The same architecture generalizes to any enterprise document-grounded assistant, and the MCP integration layer (Section 7.5) extends it for legal-research use cases via LegiScan, Westlaw, and LexisNexis.
 
 ---
 
@@ -15,6 +15,7 @@ The flow Claude should be able to draw on a whiteboard in 60 seconds:
 3. **Retrieval**: Hybrid retrieval (semantic + keyword) via Bedrock KB on OpenSearch Serverless, with metadata filters from JWT claims.
 4. **Generation**: Bedrock `RetrieveAndGenerate` (or `Retrieve` + custom prompt) with Claude/Nova as the LLM, Bedrock Guardrails attached on input + output.
 5. **Agentic actions**: Bedrock Agents (or AgentCore for advanced cases) invoke Lambda tools with allowlisting, schema validation, and human-in-the-loop approval for sensitive operations.
+5a. **External authoritative sources** (when applicable): MCP servers wrapping enterprise APIs (LegiScan, Westlaw, LexisNexis, or domain equivalents) exposed via AgentCore Gateway with OAuth on-behalf-of identity propagation.
 6. **State + audit**: DynamoDB for sessions and audit log, RDS PostgreSQL for relational metadata.
 7. **Edge**: API Gateway → Lambda (or Fargate for long-running) → frontend on S3 + CloudFront, with Cognito auth.
 8. **Observability + evals**: CloudWatch dashboards, X-Ray tracing, Bedrock model invocation logs to S3, continuous LLM-as-judge eval harness running on every release.
@@ -87,30 +88,347 @@ EventBridge + SQS gives you DLQs, replay, idempotency keys, and the ability to a
 ## 3) Preprocessing + Chunking + Metadata Enrichment
 
 ### Step
-Convert raw documents into clean, chunked, metadata-tagged content.
+Convert raw documents into clean, chunked, metadata-tagged content. **For legal documents, chunking is the single highest-leverage decision in the entire pipeline** — it determines whether a chunk contains a complete legal thought or a fragment that loses meaning the moment it leaves its surrounding context.
 
-### Option A (Picked): Bedrock Knowledge Base managed parsing + custom Lambda for metadata enrichment
-- **Pros**: KB handles PDF/DOCX/HTML parsing, supports semantic/hierarchical/fixed chunking out of the box, optional FM-based parsing for tables and complex layouts. Lambda layer adds custom metadata.
-- **Cons**: Less control over the exact chunking algorithm than a custom pipeline.
+### Why structural chunking is non-negotiable for legal content
 
-### Option B: Custom pipeline (Lambda + Textract + custom chunker)
-- **Pros**: Full control. Useful for highly structured documents (legal, medical) where chunk boundaries matter for retrieval quality.
-- **Cons**: You own parsing quality, OCR tuning, edge cases. Months of work to match what KB gives free.
+Legal documents are not prose. They are hierarchically structured artifacts where meaning is bound to structural boundaries:
+- A **statute** is a tree: title → chapter → section → subsection → paragraph → subparagraph → clause. Each level is a self-contained legal unit with an explicit citation handle.
+- A **contract** is a sequence of clauses, recitals, definitions, schedules, and exhibits. A single clause is the indivisible unit of obligation.
+- A **judicial opinion** has a syllabus, headnotes, facts, procedural history, holding, reasoning, and disposition. Holdings and dictum live in different sections and have different legal weight.
+- A **regulation** has parts, subparts, sections, and notes. Cross-references to other CFR sections are everywhere.
 
-### Option C: Bedrock Data Automation
-- **Pros**: Best for visually-rich documents with tables/charts/images.
-- **Cons**: Higher cost; overkill if docs are mostly text.
+Fixed-size or token-based chunking destroys this structure. Splitting a contract clause across two chunks means neither chunk represents a complete obligation. Splitting a statute mid-subsection means the conditions and the rule may end up retrieved separately — and a conditional rule retrieved without its conditions is worse than no retrieval at all. Splitting a judicial opinion across the line between holding and dictum means the model can't tell binding precedent from non-binding commentary.
+
+The rule is: **chunk boundaries must align with legal-citation boundaries**. If a chunk cannot be cited to a specific structural element (e.g., "11 U.S.C. § 362(d)(2)" or "Roe v. Wade, 410 U.S. 113, 152–53 (1973)"), it is the wrong chunk.
+
+### Option A (Picked): Structural parsing + structure-aware chunking + Bedrock KB custom chunking via Lambda transformer
+- **Pros**: Chunks align with statute sections, contract clauses, opinion holdings — the natural retrieval units. Citations become intrinsic metadata, not bolted-on. KB still owns embeddings, indexing, sync — only chunking logic is custom.
+- **Cons**: Per-document-type parsers to build and maintain. Edge cases (malformed docs, scanned PDFs with no structure) require fallback paths.
+
+### Option B: Bedrock KB default hierarchical chunking (1500/300 tokens)
+- **Pros**: Zero implementation work. Works adequately for prose-heavy memos and briefs.
+- **Cons**: **Wrong for primary legal sources.** Splits sections, clauses, and holdings at arbitrary token boundaries. Retrieval quality on statute and contract questions suffers measurably. Citation grounding becomes unreliable.
+
+### Option C: Pure semantic chunking via embedding similarity
+- **Pros**: Adapts to topic shifts in narrative content.
+- **Cons**: Ignores explicit document structure that legal documents *give you for free*. Burns embedding cost to discover boundaries the parser already knows.
 
 ### Why pick A
-Start with managed KB parsing + chunking, then drop in a **custom chunking Lambda** specifically for document types where the default chunker hurts retrieval (e.g., contracts with section boundaries). Bedrock KB supports custom chunking via Lambda transformation — you keep the managed pipeline but inject domain logic exactly where it matters. This is the right answer to the "Bedrock KB vs custom" trade-off question.
+For legal documents, structure is a feature of the source, not something to infer. Use it. Bedrock KB supports custom chunking via Lambda transformer specifically for cases like this — you keep the managed embedding/index/sync pipeline and inject domain-aware chunking exactly at the right layer.
+
+The realistic production setup is a **routing parser**: classify the document by type, then dispatch to the appropriate structural parser. A scanned letter with no structure falls back to default token chunking; a Connecticut General Statutes section gets parsed into its hierarchical tree.
+
+### Chunking strategy by document type
+
+The plan defines explicit chunking policies per document type. This is the table that should be in the runbook:
+
+**Statutes and regulations** (CT General Statutes, U.S. Code, CFR, state codes)
+- Parse the section hierarchy explicitly (section → subsection → paragraph → subparagraph → clause).
+- One chunk per leaf section by default. If a leaf exceeds ~1,500 tokens, split at the next-finest structural boundary (subsection or paragraph), never mid-sentence.
+- **Parent-child indexing**: index small leaf chunks for retrieval precision, but on a hit, return the full parent section as context. This is the small-to-big pattern — retrieve precise, generate complete. Bedrock KB's hierarchical chunking option supports this natively when configured with structural separators.
+- Each chunk carries the full citation as metadata: `{title: 11, chapter: 5, section: 362, subsection: "d", paragraph: "2", citation: "11 U.S.C. § 362(d)(2)"}`.
+
+**Contracts and agreements**
+- Parse by clause. A clause is the atomic unit; never split it.
+- Recitals, definitions, and schedules each form their own chunks with type metadata.
+- Cross-references between clauses (e.g., "subject to Section 7.3") are preserved as metadata so the retrieval layer can pull both clauses when needed.
+- A single oversized clause (rare, but happens in master service agreements) gets split at sentence boundaries with explicit `part 1 of N` metadata; never silently fragmented.
+
+**Judicial opinions**
+- Parse the canonical sections (syllabus, headnotes, facts, procedural history, issues, holding, reasoning, disposition, dissents, concurrences).
+- One chunk per logical section, tagged with section type. **The `section_type` metadata is critical** — it lets retrieval distinguish holding from dictum, majority from dissent, headnote from full reasoning.
+- Each chunk carries the full case citation, court, judges, decision date, and jurisdiction.
+- For long reasoning sections, split at paragraph boundaries with structural breadcrumbs preserved.
+
+**Briefs, memos, and pleadings**
+- Parse by heading hierarchy (Argument I, Argument I.A, Argument I.A.1).
+- Each leaf argument section is a chunk. Headings and the chunk's parent-heading path become metadata.
+- Footnotes attach to the parent chunk (legal footnotes often contain controlling citations and must travel with the argument).
+
+**Forms and templates**
+- Parse by form field and section.
+- Each filled-out field becomes a structured chunk; unfilled template language is excluded from indexing or tagged separately.
+
+**Email, correspondence, narrative memos** (the only place fixed-size chunking is acceptable)
+- Default to recursive paragraph chunking with token cap fallback.
+- This is the small minority of legal documents and the only case where structural parsing buys nothing.
+
+### Citations and cross-references — the metadata that makes legal RAG work
+
+For every legal chunk, capture and index as filterable metadata:
+
+- `citation` (Bluebook-formatted canonical citation; the human-readable handle)
+- `jurisdiction` (federal, state code, agency, court)
+- `effective_date` and `version` (statutes get amended; case law gets reversed; chunks must be time-aware)
+- `superseded_by` and `supersedes` (amendment chain)
+- `cross_references` (other statutes/cases this chunk cites)
+- `treatment_signals` (KeyCite or Shepard's flags from Section 7.5 MCP servers, refreshed on a cadence)
+- `section_type` for opinions (holding, dictum, dissent, etc.)
+- `document_type` (statute, regulation, opinion, contract, brief, memo)
+- `tenant_id`, `matter_id`, `classification` (PII / privilege level)
+
+These metadata fields drive filterable retrieval. "Find me CT statutes on premises liability effective in 2024 that haven't been amended" is a metadata-filtered query, not a semantic search problem. Most legal retrieval failures aren't embedding failures — they're missing or wrong metadata.
+
+### Parent-child / small-to-big retrieval pattern
+
+The single most important retrieval pattern for legal RAG, and the answer to "how do you balance retrieval precision with context completeness":
+
+1. **Index** small, precise chunks (single subsection, single clause, single holding paragraph) — high embedding precision, high retrieval recall.
+2. **On a hit**, the retrieval layer doesn't return only the small chunk. It returns the small chunk *plus its parent section* (the full statute section, the full contract clause group, the full opinion section).
+3. The model gets the precise hit *and* enough surrounding context to interpret it correctly.
+
+Bedrock KB hierarchical chunking implements this directly when configured with structural separators. The custom Lambda transformer's job is to emit chunks tagged with their parent IDs so KB can reconstitute the parent context at retrieval time.
 
 ### Build actions
-1. Create Bedrock KB data source pointing at the S3 prefix.
-2. Default chunking strategy: hierarchical (parent 1500 tokens, child 300 tokens) — good baseline for most docs.
-3. Custom Lambda transformer for documents needing domain-aware chunking.
-4. Metadata file (`.metadata.json`) co-located with each source document, capturing: tenant, doc_type, effective_date, jurisdiction, version, source_system, classification (PII level).
-5. Metadata becomes filterable at retrieval time — critical for tenant isolation and freshness filters.
-6. Sync schedule: event-driven on object create + nightly full reconciliation job.
+
+1. **Document type classifier** (Lambda, runs at ingest):
+   - Heuristic + small classifier model decides: statute, regulation, opinion, contract, brief, memo, correspondence, form, scanned/unstructured.
+   - Routes to the appropriate structural parser.
+   - Confidence below threshold → quarantine queue for human review, don't silently fall through to default chunking.
+
+2. **Per-type structural parsers** (Lambda layer or shared library):
+   - Statute parser: regex + grammar for "§", "Sec.", "Subsection", state-specific patterns. Open-source options exist for U.S. Code and CFR; state codes need custom rules.
+   - Contract parser: clause boundary detection (numbered headings, "WHEREAS", "NOW THEREFORE", definition blocks). Open-source library candidates: LexNLP, custom spaCy pipelines.
+   - Opinion parser: section detection by canonical headers and reporter formatting. Westlaw/Lexis returns structured opinions via API (Section 7.5) — prefer the structured form when available.
+   - Brief/memo parser: heading hierarchy detection from DOCX styles or PDF outline.
+   - Fallback: recursive paragraph chunking with token cap.
+
+3. **Bedrock KB custom chunking transformer** (Lambda):
+   - Receives raw document, calls the routing parser, returns chunks in KB's expected format with metadata attached.
+   - Each chunk includes parent ID for parent-child reconstitution.
+
+4. **Metadata file** (`.metadata.json`) co-located with each source document — captures bibliographic and access-control metadata at the document level (tenant, classification, source, ingest_date). Per-chunk legal metadata is added by the parser, not from this file.
+
+5. **OCR fallback path**:
+   - Scanned PDFs go through Textract first.
+   - OCR output goes through structural parsing if structure is recoverable (most legal scans have clear section headers); otherwise falls back to paragraph chunking.
+   - OCR confidence is captured per chunk; low-confidence chunks get a metadata flag so the retrieval layer can warn or downweight.
+
+6. **Validation gates**:
+   - Reject chunks where citation parsing failed but document type implies citations should exist.
+   - Reject chunks larger than the embedding model's effective context window.
+   - Reject zero-content chunks (parser bugs).
+   - Failed validations route to a quarantine queue with a human-review UI.
+
+7. **Eval-driven tuning** (ties to Section 11):
+   - Golden retrieval set includes structural questions: "find § 362(d)(2)" must return that exact subsection, not the full section. "Find the indemnification clause in this MSA" must return the indemnification clause, not adjacent boilerplate.
+   - When the eval set shows retrieval misses on a document type, the chunking parser for that type is the first place to look, not the embedding model.
+
+8. **Sync schedule**: event-driven on object create + nightly full reconciliation job to catch any docs whose chunks failed validation and were quarantined.
+
+### What to mention to Kirti about this section
+
+This is one of the strongest places to demonstrate senior judgment. The takeaway: **chunking is a domain problem, not a generic one**. Default Bedrock KB chunking is a reasonable starting point for prose-heavy enterprise documents (HR policies, customer FAQs, marketing collateral). For any domain where documents have explicit structure that maps to retrieval intent — legal, medical, financial filings, regulatory submissions, technical specifications — structural chunking is the production default and fixed-size is the fallback. Saying this clearly tells Kirti you've actually shipped retrieval at quality, not just configured a tutorial.
+
+---
+
+## 3.5) Worked Examples — Parsing Real CT Statutes
+
+These examples use real text from **Conn. Gen. Stat. § 52-572h** (Connecticut's comparative negligence statute) to make the chunking strategy concrete. The statute has a complex structure: subsection (a) contains four numbered definitions, subsections (b)–(g) contain the substantive rules with multiple cross-references, and subsections (l)–(o) contain abolition and limitation clauses. It's a realistic test case — typical CT statutes look like this.
+
+### Example 1 — Definitions subsection with nested numbered paragraphs
+
+**Source text** (Conn. Gen. Stat. § 52-572h(a)):
+
+> (a) For the purposes of this section: (1) "Economic damages" means compensation determined by the trier of fact for pecuniary losses including, but not limited to, the cost of reasonable and necessary medical care, rehabilitative services, custodial care and loss of earnings or earning capacity excluding any noneconomic damages; (2) "noneconomic damages" means compensation determined by the trier of fact for all nonpecuniary losses including, but not limited to, physical pain and suffering and mental and emotional suffering; (3) "recoverable economic damages" means the economic damages reduced by any applicable findings including but not limited to set-offs, credits, comparative negligence, additur and remittitur, and any reduction provided by section 52-225a; (4) "recoverable noneconomic damages" means the noneconomic damages reduced by any applicable findings including but not limited to set-offs, credits, comparative negligence, additur and remittitur.
+
+**Wrong: token-based chunking (1500/300 default)**
+
+This whole subsection would be ~280 tokens, so default chunking might combine it with subsection (b) (the contributory negligence rule) into a single chunk. Or worse, if the section above § 52-572h spilled into the chunk window, the chunk would start mid-statute. Either way: a query for "what does Connecticut define as economic damages" would either retrieve a chunk with two unrelated rules in it, or miss the definition because it's buried in noise. The cross-reference in (a)(3) to "section 52-225a" loses its handle.
+
+**Right: structural chunking — one chunk per definition**
+
+The parser emits four leaf chunks plus one parent context chunk. Each definition is independently retrievable, and the parent chunk gives the model the framing language ("For the purposes of this section:") that's needed to interpret any definition correctly.
+
+```json
+[
+  {
+    "chunk_id": "ct-gs-52-572h-a-parent",
+    "parent_id": "ct-gs-52-572h-root",
+    "text": "(a) For the purposes of this section: [contains definitions (1)-(4)]",
+    "metadata": {
+      "citation": "Conn. Gen. Stat. § 52-572h(a)",
+      "title": 52,
+      "chapter": 925,
+      "section": "52-572h",
+      "subsection": "a",
+      "structural_role": "definitions_header",
+      "jurisdiction": "CT",
+      "document_type": "statute",
+      "effective_date": "2024-10-01",
+      "child_chunk_ids": [
+        "ct-gs-52-572h-a-1", "ct-gs-52-572h-a-2",
+        "ct-gs-52-572h-a-3", "ct-gs-52-572h-a-4"
+      ]
+    }
+  },
+  {
+    "chunk_id": "ct-gs-52-572h-a-1",
+    "parent_id": "ct-gs-52-572h-a-parent",
+    "text": "(1) \"Economic damages\" means compensation determined by the trier of fact for pecuniary losses including, but not limited to, the cost of reasonable and necessary medical care, rehabilitative services, custodial care and loss of earnings or earning capacity excluding any noneconomic damages",
+    "metadata": {
+      "citation": "Conn. Gen. Stat. § 52-572h(a)(1)",
+      "subsection": "a",
+      "paragraph": "1",
+      "structural_role": "definition",
+      "defined_term": "economic damages",
+      "cross_references": []
+    }
+  },
+  {
+    "chunk_id": "ct-gs-52-572h-a-2",
+    "parent_id": "ct-gs-52-572h-a-parent",
+    "text": "(2) \"noneconomic damages\" means compensation determined by the trier of fact for all nonpecuniary losses including, but not limited to, physical pain and suffering and mental and emotional suffering",
+    "metadata": {
+      "citation": "Conn. Gen. Stat. § 52-572h(a)(2)",
+      "subsection": "a",
+      "paragraph": "2",
+      "structural_role": "definition",
+      "defined_term": "noneconomic damages",
+      "cross_references": []
+    }
+  },
+  {
+    "chunk_id": "ct-gs-52-572h-a-3",
+    "parent_id": "ct-gs-52-572h-a-parent",
+    "text": "(3) \"recoverable economic damages\" means the economic damages reduced by any applicable findings including but not limited to set-offs, credits, comparative negligence, additur and remittitur, and any reduction provided by section 52-225a",
+    "metadata": {
+      "citation": "Conn. Gen. Stat. § 52-572h(a)(3)",
+      "subsection": "a",
+      "paragraph": "3",
+      "structural_role": "definition",
+      "defined_term": "recoverable economic damages",
+      "cross_references": ["Conn. Gen. Stat. § 52-225a"]
+    }
+  },
+  {
+    "chunk_id": "ct-gs-52-572h-a-4",
+    "parent_id": "ct-gs-52-572h-a-parent",
+    "text": "(4) \"recoverable noneconomic damages\" means the noneconomic damages reduced by any applicable findings including but not limited to set-offs, credits, comparative negligence, additur and remittitur",
+    "metadata": {
+      "citation": "Conn. Gen. Stat. § 52-572h(a)(4)",
+      "subsection": "a",
+      "paragraph": "4",
+      "structural_role": "definition",
+      "defined_term": "recoverable noneconomic damages",
+      "cross_references": []
+    }
+  }
+]
+```
+
+**Why this works at retrieval time**: a user asking "what is recoverable economic damages under CT law" gets a precise hit on the (a)(3) chunk, plus the parent context, plus the cross-referenced § 52-225a (resolved by the cross_references metadata). All four pieces arrive together, ranked correctly, with citations the model can quote verbatim.
+
+### Example 2 — Substantive rule with cross-references and a 51% threshold
+
+**Source text** (Conn. Gen. Stat. § 52-572h(b)):
+
+> (b) In causes of action based on negligence, contributory negligence shall not bar recovery in an action by any person or the person's legal representative to recover damages resulting from personal injury, wrongful death or damage to property if the negligence was not greater than the combined negligence of the person or persons against whom recovery is sought including settled or released persons under subsection (n) of this section. The economic or noneconomic damages allowed shall be diminished in the proportion of the percentage of negligence attributable to the person recovering which percentage shall be determined pursuant to subsection (f) of this section.
+
+This subsection contains *the* core comparative-negligence rule in Connecticut: the modified comparative negligence threshold (recovery barred if plaintiff's negligence is *greater than* defendants' combined — i.e., the 51% rule), and it cross-references subsection (f) for the percentage-determination procedure and subsection (n) for treatment of settled parties.
+
+**Wrong: paragraph chunking that ignores cross-references**
+
+Pure paragraph chunking would chunk this correctly as a unit, but it would lose the cross-references as untyped text. A user asking "how is the percentage of negligence determined under CT comparative negligence" would not retrieve subsection (f) unless they happened to know the answer is buried inside (b). The cross-reference is lexically present but semantically invisible.
+
+**Right: structural chunking with typed cross-references**
+
+```json
+{
+  "chunk_id": "ct-gs-52-572h-b",
+  "parent_id": "ct-gs-52-572h-root",
+  "text": "(b) In causes of action based on negligence, contributory negligence shall not bar recovery in an action by any person or the person's legal representative to recover damages resulting from personal injury, wrongful death or damage to property if the negligence was not greater than the combined negligence of the person or persons against whom recovery is sought including settled or released persons under subsection (n) of this section. The economic or noneconomic damages allowed shall be diminished in the proportion of the percentage of negligence attributable to the person recovering which percentage shall be determined pursuant to subsection (f) of this section.",
+  "metadata": {
+    "citation": "Conn. Gen. Stat. § 52-572h(b)",
+    "title": 52,
+    "chapter": 925,
+    "section": "52-572h",
+    "subsection": "b",
+    "structural_role": "substantive_rule",
+    "rule_type": "comparative_negligence_threshold",
+    "topic_tags": ["comparative_negligence", "contributory_negligence", "personal_injury", "wrongful_death", "property_damage"],
+    "jurisdiction": "CT",
+    "document_type": "statute",
+    "effective_date": "2024-10-01",
+    "cross_references": [
+      {
+        "citation": "Conn. Gen. Stat. § 52-572h(f)",
+        "type": "internal",
+        "purpose": "procedure_reference",
+        "phrase": "shall be determined pursuant to subsection (f)"
+      },
+      {
+        "citation": "Conn. Gen. Stat. § 52-572h(n)",
+        "type": "internal",
+        "purpose": "scope_reference",
+        "phrase": "settled or released persons under subsection (n)"
+      }
+    ],
+    "case_law_treatment": [
+      {"reporter_citation": "190 Conn. 791", "treatment": "interpreted", "note": "assumption-of-risk overlap with comparative negligence"}
+    ]
+  }
+}
+```
+
+**Why this works at retrieval time**: the typed cross-references mean the retrieval orchestrator knows that any answer touching subsection (b) should also pull (f) and (n). The `rule_type` tag lets the agent identify this as a threshold rule, not a definition or limitation. The case-law treatment metadata, populated from KeyCite/Shepard's via the MCP layer (Section 7.5), warns the model that there's interpretive case law it needs to consider — preventing the model from confidently restating only the statutory text when a Connecticut Supreme Court decision has refined how it applies.
+
+### Example 3 — Single-sentence abolition clause and why it must stay atomic
+
+**Source text** (Conn. Gen. Stat. § 52-572h(l)):
+
+> (l) The legal doctrines of last clear chance and assumption of risk in actions to which this section is applicable are abolished.
+
+A single sentence, 21 words. To a token-counting chunker, this looks like a fragment that should be merged with neighbors. **That would be wrong.** This sentence abolishes two centuries of common-law doctrine in Connecticut tort law, and the rule depends entirely on its scope ("in actions to which this section is applicable"). Merging it with subsection (m) (about the family car doctrine) creates a chunk where two unrelated abolitions blur together, and a query about assumption of risk could retrieve the chunk but miss the precise scope.
+
+**Wrong: merging short subsections to hit a token target**
+
+```
+chunk: "(l) The legal doctrines of last clear chance and assumption of risk
+        in actions to which this section is applicable are abolished.
+        (m) The family car doctrine shall not be applied to impute
+        contributory or comparative negligence pursuant to this section
+        to the owner of any motor vehicle or motor boat.
+        (n) A release, settlement or similar agreement..."
+```
+
+A query like "is assumption of risk still a defense in CT negligence cases" might retrieve this merged chunk — but the model now has to figure out which subsection answers the question, and the citation it generates will be ambiguous. Worse, in a hybrid retrieval scoring environment, the embedding for this merged chunk dilutes across three unrelated topics; retrieval recall on any single topic suffers.
+
+**Right: each subsection as its own chunk, regardless of brevity**
+
+```json
+{
+  "chunk_id": "ct-gs-52-572h-l",
+  "parent_id": "ct-gs-52-572h-root",
+  "text": "(l) The legal doctrines of last clear chance and assumption of risk in actions to which this section is applicable are abolished.",
+  "metadata": {
+    "citation": "Conn. Gen. Stat. § 52-572h(l)",
+    "subsection": "l",
+    "structural_role": "abolition_clause",
+    "abolished_doctrines": ["last clear chance", "assumption of risk"],
+    "scope_qualifier": "in actions to which this section is applicable",
+    "topic_tags": ["last_clear_chance", "assumption_of_risk", "common_law_abolition"],
+    "case_law_treatment": [
+      {"reporter_citation": "190 Conn. 791", "treatment": "limited", "note": "assumption-of-risk overlap with comparative negligence when plaintiff's conduct is unreasonable"}
+    ]
+  }
+}
+```
+
+**Why this works at retrieval time**: a user asking "is assumption of risk abolished in Connecticut" gets an exact hit on a 21-word chunk that says precisely yes, with the scope qualifier intact, with the citation handle, and with a flag that there's interpretive case law (190 Conn. 791) that limits the abolition where assumption-of-risk overlaps with unreasonable plaintiff conduct. The model can answer correctly *and* cite the limit *and* point the user at the case — none of which is possible if this clause is buried in a 1500-token chunk with two unrelated rules.
+
+### Pattern summary across the three examples
+
+| Example | Length | Token-chunker mistake | Structural-chunker outcome |
+|---|---|---|---|
+| § 52-572h(a) definitions | 280 tokens | Merges definitions with substantive rule (b) | 1 parent + 4 leaf chunks, each definition independently retrievable, cross-reference to § 52-225a typed |
+| § 52-572h(b) main rule | 130 tokens | Drops cross-references as untyped text | Single chunk with typed cross-refs to (f) and (n), plus case-law treatment from KeyCite/Shepard's |
+| § 52-572h(l) abolition | 21 tokens | Merges with adjacent subsections to hit token target | Single atomic chunk, scope qualifier preserved, case-law limit flagged |
+
+The principle is the same in every case: **the legal unit is the chunk unit**, regardless of token count. Short subsections stay short. Long subsections split at the next-finest structural boundary, never mid-sentence.
+
+
 
 ---
 
@@ -258,7 +576,207 @@ Start with Bedrock Agents — the simpler abstraction. Move to AgentCore when on
 
 ---
 
-## 8) State, Sessions, and Audit
+## 7.5) External Legal Research MCP Servers (LegiScan, Westlaw, LexisNexis)
+
+### Step
+Extend the agent's tool surface with authoritative external legal research sources via the Model Context Protocol (MCP). This is the layer that turns a document-grounded assistant into a true legal research assistant — internal documents grounded by Bedrock KB, external authoritative sources grounded by MCP-wrapped APIs.
+
+Each provider has a different role in the research workflow:
+- **LegiScan** — real-time legislative tracking across all 50 states and Congress (bills, sponsors, roll-call votes, status changes). Best for "is there pending legislation that affects this?" questions. Public REST API, key-based auth, generous rate limits.
+- **Westlaw** — primary case law and secondary sources, the Key Number System for cross-jurisdiction precedent discovery, KeyCite for citation validity flags. Best for "find me precedent and tell me if it's still good law." OAuth 2.0, contractual enterprise API, strict ToS on caching and downstream use.
+- **LexisNexis** — case law, statutes, Shepard's Citations (deeper citation history than KeyCite), Lex Machina for judge/court analytics, broad public records. Best for citation depth and litigation analytics. OAuth 2.0, contractual enterprise API, similar ToS constraints.
+
+### Why MCP and not direct API calls
+1. **Standardized tool interface.** MCP gives every external source the same shape (resources, tools, prompts) so the agent doesn't need provider-specific glue. New provider = new MCP server, no agent code change.
+2. **Centralized auth and rate limit management.** Provider credentials live in the MCP server, never in the agent.
+3. **Auditability.** Every tool call goes through one chokepoint; one log to query for compliance.
+4. **Vendor portability.** If you swap LexisNexis for Bloomberg Law later, only the MCP server changes.
+
+### Option A (Picked): Bedrock AgentCore Gateway with one MCP server per provider, deployed on AgentCore Runtime
+- **Pros**: AgentCore Gateway is purpose-built to expose tools to agents over MCP, handles auth/identity via AgentCore Identity, runs in microVM-isolated sessions, native OTEL observability, OAuth 2.0 inbound and outbound flows. Designed exactly for this pattern.
+- **Cons**: AgentCore is newer; some primitives are still maturing. Requires AgentCore for the agent layer (Section 7) rather than vanilla Bedrock Agents.
+
+### Option B: MCP servers as Lambda functions exposed via API Gateway, registered as Bedrock Agent action groups
+- **Pros**: Works with vanilla Bedrock Agents (Section 7 Option A). No AgentCore dependency. Standard serverless ops.
+- **Cons**: You're translating MCP semantics into action-group semantics, losing some MCP-native features (resources, prompts, sampling). More glue code per provider.
+
+### Option C: MCP servers on ECS Fargate behind ALB, with custom orchestration
+- **Pros**: Long-running connections, persistent state, framework choice (FastMCP, official Python/TS SDKs).
+- **Cons**: Always-on cost, more ops surface, no native AWS agent integration.
+
+### Why pick A
+This is exactly the use case AgentCore Gateway and Runtime were built for. The legal research domain has three real constraints that AgentCore handles well:
+1. **Per-user OAuth identity** — Westlaw and LexisNexis bill per seat and audit by user, so the agent must call upstream APIs *on behalf of the actual attorney*, not with a shared service principal. AgentCore Identity handles this OAuth-on-behalf-of flow.
+2. **Session isolation** — different attorneys working different matters must not share context. AgentCore Runtime gives each session its own microVM.
+3. **Tool-boundary policy** — some tools (e.g., LexisNexis full-document export) are billable per call and need explicit policy guardrails. AgentCore Policy enforces this at the tool layer.
+
+Section 7 should be revisited with this in mind: if MCP integration is in scope, AgentCore moves from "future upgrade" to "primary choice."
+
+### Architecture overview
+
+```
+                    ┌─────────────────────┐
+   User (attorney) ─┤  React + Cognito    │
+                    └──────────┬──────────┘
+                               │ JWT
+                    ┌──────────▼──────────┐
+                    │   API Gateway       │
+                    └──────────┬──────────┘
+                               │
+                    ┌──────────▼──────────┐
+                    │  AgentCore Runtime  │  ← agent reasoning loop
+                    │  (one session/user) │
+                    └────┬────────────┬───┘
+                         │            │
+              ┌──────────▼──┐   ┌─────▼──────────────┐
+              │ Bedrock KB  │   │ AgentCore Gateway  │
+              │ (internal   │   │  (MCP front door)  │
+              │  docs)      │   └─────┬──────────────┘
+              └─────────────┘         │
+                                      │ MCP (over HTTP/SSE)
+                  ┌───────────────────┼───────────────────┐
+                  │                   │                   │
+        ┌─────────▼──────┐  ┌─────────▼──────┐  ┌─────────▼──────┐
+        │ legiscan-mcp   │  │ westlaw-mcp    │  │ lexis-mcp      │
+        │ (Lambda)       │  │ (Fargate)      │  │ (Fargate)      │
+        └─────────┬──────┘  └─────────┬──────┘  └─────────┬──────┘
+                  │                   │                   │
+                  ▼                   ▼                   ▼
+            LegiScan API        Westlaw API         LexisNexis API
+            (API key)           (OAuth on-behalf)   (OAuth on-behalf)
+```
+
+Each MCP server is a **separate deployable** with its own IAM role, secrets, rate-limit policy, and audit log. They share a common library for MCP protocol, OTEL instrumentation, retries, and circuit-breaking.
+
+### Per-provider integration design
+
+#### LegiScan MCP server
+- **Runtime**: Lambda. Stateless, low traffic, key-based auth — Lambda is the right cost profile.
+- **Auth**: Single API key in Secrets Manager, rotated quarterly. (LegiScan does not support OAuth on-behalf-of; usage is keyed per organization.)
+- **Tools exposed via MCP**:
+  - `search_bills(query, state?, session?, status?)` → list of bills with metadata
+  - `get_bill_details(bill_id)` → full bill text, sponsors, history
+  - `get_roll_call(roll_call_id)` → vote breakdown by legislator
+  - `track_topic(keywords, jurisdictions[])` → register a GAITS-style alert
+  - `list_recent_changes(jurisdiction, since_date)` → bills with status changes
+- **Resources exposed via MCP**: bill text snapshots cached as MCP resources for the agent to retrieve without re-calling the API.
+- **Caching**: ElastiCache Redis with 1-hour TTL on search results, 24-hour TTL on bill detail (legislation moves slowly). Cache key includes jurisdiction + query hash.
+- **Rate limits**: LegiScan free tier is 30K queries/month; paid tiers higher. Token bucket per tenant, default 60/min, with a global ceiling that triggers a CloudWatch alarm at 80% of monthly quota.
+- **Cost**: well under $500/month for typical research load on a paid plan.
+
+#### Westlaw MCP server
+- **Runtime**: Fargate. Long-lived OAuth tokens, connection pooling to the upstream API, more complex request shaping — justifies a persistent service over Lambda cold-starts.
+- **Auth**: OAuth 2.0 authorization code flow on behalf of the attorney. AgentCore Identity handles the inbound OAuth (attorney → AgentCore) and outbound OAuth (AgentCore → Westlaw) token exchange. Access tokens cached per user with refresh handling. **Never use a shared service account** — Westlaw audits by user and ToS prohibits credential sharing.
+- **Tools exposed via MCP**:
+  - `search_cases(query, jurisdiction?, court?, date_range?, key_numbers?)` → case list with citations
+  - `get_case(citation)` → full case text + headnotes + KeyCite status
+  - `keycite_check(citation)` → flag (red/yellow/green) + treating cases
+  - `find_by_key_number(key_number, jurisdiction?)` → cases organized under that legal point
+  - `secondary_sources(topic, jurisdiction?)` → treatises, ALR articles, law reviews
+  - `find_statute(jurisdiction, code, section)` → statute text with annotations
+- **Caching**: **Strict ToS-aware caching policy**. Westlaw ToS generally prohibits long-term caching of full case text or building a derivative database. Cache only:
+  - KeyCite flags for 6 hours (operational latency reduction).
+  - Citation metadata (case name, court, date) for 30 days.
+  - **Never cache full case text** beyond the request session unless your contract permits.
+  - Document this policy in the MCP server config and review with Westlaw account rep before production. Get it in writing.
+- **Audit**: every call logged with attorney user_id, matter_id, query, timestamp, citations returned. This is what you show in a Westlaw audit and what protects the firm if a usage dispute arises.
+- **Rate limits**: per-user quota matched to seat license; circuit breaker on 429 responses.
+
+#### LexisNexis MCP server
+- **Runtime**: Fargate, same reasoning as Westlaw.
+- **Auth**: OAuth 2.0 on-behalf-of, identical pattern to Westlaw.
+- **Tools exposed via MCP**:
+  - `search_cases(query, jurisdiction?, court?, date_range?)` → case list
+  - `get_case(citation)` → full case
+  - `shepardize(citation)` → Shepard's signal + citing references with treatment indicators
+  - `search_statutes(jurisdiction, query)` → statute search
+  - `judge_analytics(judge_name, court)` → Lex Machina-style judge behavior data
+  - `motion_outcomes(motion_type, court?, judge?)` → win/loss analytics
+  - `public_records(person_name, record_type)` → public records search (gated by tenant policy)
+- **Caching**: same ToS-aware approach as Westlaw. Shepard's signals cached 6 hours; full text not cached cross-session.
+- **Special handling**: public records search is gated behind explicit policy — only certain roles can invoke it, and every call requires a matter_id justification logged for audit. This is Sarbanes-Oxley / privacy compliance territory.
+
+### MCP server implementation pattern (shared library)
+
+Every MCP server in this system shares a common skeleton:
+
+1. **Protocol layer**: official MCP SDK (Python `mcp` or TypeScript `@modelcontextprotocol/sdk`). Tools, resources, and prompts declared with JSON Schema for inputs.
+2. **Auth layer**: AgentCore Identity for on-behalf-of OAuth (Westlaw, LexisNexis) or Secrets Manager key retrieval (LegiScan).
+3. **Rate-limit layer**: token bucket per (tenant, user), backed by ElastiCache or DynamoDB with conditional updates.
+4. **Cache layer**: ElastiCache Redis with provider-specific TTLs and ToS-aware policies.
+5. **Resilience layer**: exponential backoff with jitter, circuit breaker (Hystrix-style), DLQ for failures, idempotency keys derived from (session_id, tool_name, input_hash).
+6. **Observability layer**: OTEL traces propagated from AgentCore, structured logs with request_id, metrics (latency, error rate, cache hit rate, upstream API cost).
+7. **Audit layer**: every invocation written to DynamoDB audit table (Section 8) with user, tool, input redacted of sensitive fields, output summary, cost.
+
+### Critical legal/contractual considerations *(this is not optional)*
+
+This is the section that makes this design real instead of a tech-demo:
+
+1. **Westlaw and LexisNexis API access requires enterprise contracts.** You don't sign up for these like a SaaS. Procurement and legal review take weeks. Confirm contract status before architecting around them.
+2. **Terms of Service constrain what you can do with the data.** Both providers prohibit:
+   - Building a derivative database from their content.
+   - Long-term caching of full document text.
+   - Sharing access across users beyond seat license.
+   - Using their data to train ML models.
+   - Re-publishing or making content available to non-licensed users.
+3. **Per-seat licensing matters for AI agents.** If an agent makes a Westlaw call on behalf of an attorney, that attorney must hold a Westlaw seat. The agent is *augmenting* the attorney's research, not *replacing* the seat license. This is why on-behalf-of OAuth is non-negotiable — it ties every API call back to a licensed user.
+4. **Audit trail is a contract requirement, not just a best practice.** Both providers can audit usage; you need to be able to produce who-called-what-when on demand.
+5. **AI-specific contract addenda.** Recent Westlaw and LexisNexis ToS updates address AI/LLM use specifically. Some uses (training, embedding, indexing) are explicitly prohibited; others (in-session retrieval, citation lookup, Shepard's checks via API) are explicitly permitted under defined conditions. **Get the AI addendum signed before building.**
+6. **LegiScan is more permissive** because it's public legislative data, but their ToS still prohibits redistribution and sets quotas — read the API agreement.
+
+### Build actions
+
+1. **Procurement and legal first** (parallel to engineering):
+   - Confirm Westlaw enterprise API contract + AI addendum.
+   - Confirm LexisNexis enterprise API contract + AI addendum.
+   - Confirm LegiScan API tier sized for projected volume.
+   - Document caching/retention policies per provider in writing.
+
+2. **Identity and auth setup**:
+   - AgentCore Identity provider configured for inbound OAuth from Cognito.
+   - Outbound OAuth providers registered for Westlaw and LexisNexis.
+   - LegiScan API key stored in Secrets Manager with rotation policy.
+   - Test on-behalf-of token exchange end to end before building any tool.
+
+3. **MCP server scaffolding**:
+   - Create shared library (`mcp-common`) with protocol, auth, rate-limit, cache, resilience, observability, and audit layers.
+   - Build LegiScan MCP server first (simplest auth, most permissive ToS) — proves the pattern.
+   - Build Westlaw MCP server second; the OAuth on-behalf-of flow is the hardest part.
+   - Build LexisNexis MCP server third; reuses Westlaw patterns.
+
+4. **AgentCore Gateway registration**:
+   - Register each MCP server with AgentCore Gateway.
+   - Define tool-level policies (which roles can invoke which tools).
+   - Configure approval gates for any billable or high-risk tools (LexisNexis public records, full-text exports).
+
+5. **Eval and quality gates**:
+   - Add legal-research-specific evals: "given this hypothetical, did the agent retrieve the controlling case?", "did Shepard's signals get correctly interpreted?", "did the agent correctly distinguish dictum from holding?"
+   - Domain experts (attorneys, paralegals) curate the eval set, not engineers.
+   - Citation correctness metric: every citation in agent output must trace to a real Westlaw/Lexis result.
+
+6. **Observability**:
+   - Per-provider dashboard: API cost, latency, error rate, cache hit rate, rate-limit headroom.
+   - Per-attorney usage report: queries, citations retrieved, tools invoked. Compliance + cost attribution.
+   - Anomaly alerts: sudden spike in calls (could be runaway agent), unusual access patterns.
+
+### Cost profile (rough order of magnitude)
+
+- **LegiScan**: $50–500/month depending on tier and call volume. Marginal cost per query is negligible.
+- **Westlaw**: enterprise API pricing is contractual; expect $50–200 per seat per month for API-eligible seats, plus per-query fees on certain content types. Budget conservatively until real usage data lands.
+- **LexisNexis**: similar profile to Westlaw. Lex Machina analytics often priced separately.
+- **AWS infra for the MCP layer**: <$500/month (Fargate ×2, Lambda, ElastiCache, CloudWatch). Negligible compared to the upstream API costs.
+
+The dominant cost is the upstream API spend, not AWS. Cache aggressively (within ToS), gate expensive tools behind approval, and bill back to matters/clients via the audit trail.
+
+### What to mention to Kirti about this section
+
+If the conversation goes toward external integrations or enterprise data sources (it likely will, since Oncourse partners with utilities and municipalities), this section is your bridge to a more general principle: **MCP is the right abstraction for any external authoritative data source**, not just legal research. The same pattern works for utility billing systems, municipal permit databases, weather APIs, payment processors. One server per provider, AgentCore Gateway as the front door, OAuth on-behalf-of for user-attributable calls, ToS-aware caching, audit at every boundary.
+
+This is a senior-engineer answer to "how would you integrate external systems," and it generalizes the legal-research design back to the home-services domain Oncourse cares about.
+
+---
+
+
 
 ### Step
 Where conversation state, audit events, and metadata live.
@@ -375,6 +893,86 @@ Bedrock KB Evaluations exist precisely for this and integrate with the rest of t
 7. **Production drift monitoring**: sample 1% of production queries, run them through eval pipeline weekly, alert if metrics drift from baseline.
 8. **A/B testing**: route 5–10% of traffic to candidate version, compare metrics over a week, promote or revert.
 
+### Eval test cases that prove structural chunking is working
+
+The general framework above measures retrieval quality in aggregate. To specifically prove that *structural chunking* is doing its job (vs the system would work just as well with default token chunking), the eval suite needs targeted test cases. These are the concrete tests that go in the golden eval set, grouped by the structural property each one exercises.
+
+#### Category 1 — Subsection precision (does the retrieved chunk match the cited subsection?)
+
+These tests prove that chunks are scoped to the right structural unit, not bleeding across boundaries.
+
+| Test ID | Query | Expected retrieved chunk | Pass criterion |
+|---|---|---|---|
+| ST-001 | "How does Connecticut define economic damages?" | `ct-gs-52-572h-a-1` | Top-1 chunk citation = `§ 52-572h(a)(1)`. Top-3 must NOT include unrelated subsections like (b) or (c). |
+| ST-002 | "What is recoverable noneconomic damages under CT law?" | `ct-gs-52-572h-a-4` | Top-1 chunk citation = `§ 52-572h(a)(4)`. Chunk text must contain the full definition, not be cut mid-sentence. |
+| ST-003 | "Is assumption of risk still a defense in Connecticut negligence cases?" | `ct-gs-52-572h-l` | Top-1 chunk citation = `§ 52-572h(l)`. Chunk must NOT be merged with (m) or (n). |
+| ST-004 | "Does the family car doctrine apply to comparative negligence in CT?" | `ct-gs-52-572h-m` | Top-1 chunk citation = `§ 52-572h(m)`. |
+| ST-005 | "What is CT's threshold for barring recovery in comparative negligence?" | `ct-gs-52-572h-b` | Top-1 chunk citation = `§ 52-572h(b)`. Chunk must contain the "not greater than" language. |
+
+**Failure mode this catches**: a chunk that spans (l) + (m) + (n) might still retrieve for ST-003 with reasonable similarity, but the citation the model produces will be ambiguous and the answer text may quote (m) instead of (l). The pass criterion is *exact citation match on the top-1 hit*, not just topical relevance.
+
+#### Category 2 — Cross-reference resolution (does the retrieval orchestrator pull referenced subsections?)
+
+| Test ID | Query | Expected retrieved chunks (set) | Pass criterion |
+|---|---|---|---|
+| XR-001 | "How is the percentage of negligence determined under CT comparative negligence?" | `§ 52-572h(b)` AND `§ 52-572h(f)` | Both chunks in top-5. Test passes only if (f) is retrieved because (b) cross-references it, not because of independent semantic match. |
+| XR-002 | "How are settled parties treated in CT apportionment?" | `§ 52-572h(b)` AND `§ 52-572h(n)` | Both in top-5; (n) retrieved via the typed cross-reference from (b). |
+| XR-003 | "What reductions apply to recoverable economic damages?" | `§ 52-572h(a)(3)` AND `§ 52-225a` | Top-5 includes both. The cross-reference to § 52-225a (a different statute) must resolve. |
+
+**Failure mode this catches**: untyped cross-references buried as plain text in the chunk body would not trigger retrieval of the referenced subsection unless the user's query happened to embed similarly to (f) or (n)'s content. The typed `cross_references` metadata in the chunk schema is what makes this work — and these tests prove the metadata is populated and used.
+
+#### Category 3 — Parent-child reconstitution (does retrieval return the parent context with the precise hit?)
+
+| Test ID | Query | Expected behavior | Pass criterion |
+|---|---|---|---|
+| PC-001 | "What does 'economic damages' mean in CT comparative negligence?" | Retrieve precise leaf chunk `(a)(1)` AND parent chunk `(a)` | Generation context must include both. The model's response must cite `§ 52-572h(a)(1)` specifically, not just `§ 52-572h(a)`. |
+| PC-002 | "How do CT courts apportion fault among multiple defendants?" | Retrieve relevant leaf chunks under (b)–(g) PLUS section-level parent | Section-level parent gives the model framing; leaf chunks give the precise rule. |
+
+**Failure mode this catches**: returning only the precise leaf without parent context can leave the model unable to interpret the leaf correctly (e.g., a definition without the "For the purposes of this section" framing). Returning only the parent loses precision and degrades citation specificity.
+
+#### Category 4 — No-merging discipline (short subsections stay atomic)
+
+| Test ID | Query | Expected retrieved chunk | Pass criterion |
+|---|---|---|---|
+| NM-001 | "Is the family car doctrine abolished in CT comparative negligence?" | `§ 52-572h(m)` only | Top-1 chunk text must be exactly the (m) sentence. If the system returns a merged (l)+(m)+(n) chunk, this test FAILS even if the answer text is correct. |
+| NM-002 | "What common-law doctrines are abolished by § 52-572h?" | `§ 52-572h(l)` (and possibly the section parent) | Top-1 must isolate (l). Merged chunks fail. |
+
+**Failure mode this catches**: chunkers that try to "fill" toward a token target by greedily merging adjacent short subsections. The test directly inspects the *retrieved chunk text*, not the generated answer — so an answer that's correct despite a bad chunk still fails the chunking eval.
+
+#### Category 5 — Citation grounding (does the model cite the exact structural unit?)
+
+These tests evaluate the *generation* layer's behavior on top of structural chunking. They prove that good chunking translates into good citations.
+
+| Test ID | Query | Pass criteria |
+|---|---|---|
+| CG-001 | "Quote the CT statute defining economic damages." | Generated answer cites `Conn. Gen. Stat. § 52-572h(a)(1)` (subsection AND paragraph), not `§ 52-572h(a)` (subsection only) or `§ 52-572h` (section only). Quoted text exactly matches statute. |
+| CG-002 | "Under CT law, when is contributory negligence not a bar to recovery?" | Cites `§ 52-572h(b)`. Mentions the "not greater than" threshold. Does not invent percentages. |
+| CG-003 | "Does CT abolish last clear chance?" | Cites `§ 52-572h(l)`. Includes scope qualifier ("in actions to which this section is applicable"). Does not generalize beyond the statute's scope. |
+
+**Failure mode this catches**: when chunks are imprecise (e.g., the whole section in one chunk), the model often cites only the section number, losing the subsection/paragraph specificity that legal answers require. CG-001 specifically requires *paragraph-level* citation precision — only achievable if the leaf chunk is at the paragraph level.
+
+#### Category 6 — Anti-tests (negative cases, prove the system doesn't over-retrieve)
+
+| Test ID | Query | Pass criterion |
+|---|---|---|
+| AT-001 | "How does Connecticut define economic damages?" | Top-3 retrieved chunks must NOT include `§ 52-572h(b)` (substantive rule), `§ 52-572h(l)` (abolition), or any unrelated subsection. Tests that the chunker isn't producing chunks so broad that they retrieve for everything. |
+| AT-002 | "Is the family car doctrine abolished?" | Top-1 must NOT be the full section parent chunk. If only the section parent retrieves, chunks are too coarse. |
+
+#### Implementation: how these tests run in CI
+
+1. **Test data**: golden set lives in `evals/legal/ct_statutes.yaml` in the repo, version-controlled, with each test case carrying query, expected_chunk_ids, expected_citations, and pass criteria.
+2. **Runner**: a Lambda or local pytest harness that calls the Bedrock KB `Retrieve` API for each query and inspects the response.
+3. **Inspection layer**: the runner checks chunk IDs and citation metadata, not just embedding similarity. Pass/fail is deterministic, not LLM-judged, for these structural tests.
+4. **Generation tests** (Category 5) call `RetrieveAndGenerate` and use Bedrock KB Evaluations LLM-as-judge for citation correctness, plus a deterministic regex check that the citation format includes paragraph-level precision when the test requires it.
+5. **CI gate**: any PR touching the chunking parser, KB config, or embedding model must pass 100% of structural tests (Categories 1–4) and ≥95% of generation tests (Categories 5–6). Drop below threshold = build fails.
+6. **Per-document-type coverage**: the same six categories get reproduced for contracts (clause precision, no-merging across clauses), opinions (holding vs dictum precision, headnote vs full-text), and regulations (CFR section precision). 30–50 test cases per document type is a reasonable starting target.
+
+#### What to mention to Kirti about these eval cases
+
+The point that lands: **"I don't measure whether the answer sounds good. I measure whether the right chunk was retrieved with the right citation handle."** This separates teams that have actually shipped legal RAG (or any high-stakes domain RAG) from teams that have built demos. LLM-as-judge groundedness scoring is necessary but not sufficient — it can score a wrong-but-plausible answer as grounded if the retrieval brought the wrong chunk and the model paraphrased it convincingly. Deterministic structural retrieval tests catch this failure mode before it ships.
+
+
+
 ---
 
 ## 12) Observability and Operations
@@ -477,9 +1075,10 @@ For an AWS-native shop, CDK is the productive choice. AgentCore now has Terrafor
 ### Phase 1 (Weeks 1–4): Foundation + ingestion + retrieval MVP
 - AWS accounts, VPC, KMS, IAM baseline.
 - S3 bucket, EventBridge ingestion pipeline.
-- Bedrock KB on OpenSearch Serverless with default chunking.
+- Bedrock KB on OpenSearch Serverless.
+- **Document type classifier and structural chunking parsers** for the top 2–3 document types in scope (e.g., statutes + opinions + contracts; or policy docs + claim forms for insurance). Default hierarchical chunking for everything else as the fallback.
 - Retrieve API behind API Gateway + Cognito.
-- 50-question golden eval set, baseline metrics.
+- 50-question golden eval set including structural retrieval cases ("find § X(d)(2)", "find the indemnification clause"), baseline metrics.
 
 ### Phase 2 (Weeks 5–8): Generation + guardrails + production hardening
 - `RetrieveAndGenerate` with Claude Sonnet.
@@ -488,11 +1087,14 @@ For an AWS-native shop, CDK is the productive choice. AgentCore now has Terrafor
 - CloudWatch dashboards, X-Ray tracing.
 - Eval harness in CI.
 
-### Phase 3 (Weeks 9–12): Agentic capabilities + frontend
-- 3–5 read-only tools (lookup coverage, claim status, document search).
+### Phase 3 (Weeks 9–12): Agentic capabilities + MCP integrations + frontend
+- 3–5 read-only internal tools (lookup coverage, claim status, document search).
+- **MCP server scaffolding** with shared library (auth, rate-limit, cache, resilience, observability, audit).
+- **LegiScan MCP server** (simplest auth, validates the pattern).
+- **Westlaw and LexisNexis MCP servers** behind AgentCore Gateway with OAuth on-behalf-of (only if legal-research is in scope; defer if not).
 - React frontend on CloudFront.
 - Streaming responses via SSE.
-- Approval workflow for any sensitive tools.
+- Approval workflow for any sensitive or billable tools.
 
 ### Phase 4 (Weeks 13+): Scale, optimize, expand
 - Cost optimization (model tiering, prompt caching, PT analysis).
@@ -508,12 +1110,15 @@ For an AWS-native shop, CDK is the productive choice. AgentCore now has Terrafor
 When Kirti asks "why X over Y," these are the one-line answers:
 
 - **Bedrock KB vs custom pipeline**: KB by default — speed and managed quality. Custom chunking via Lambda transformer where domain boundaries matter. Full custom only if KB constraints become blockers.
+- **Chunking strategy**: structural (by section/clause/holding) for any document with explicit hierarchy — legal, medical, financial filings, regulatory, technical specs. Default token-based hierarchical (1500/300) only for prose-heavy memos and correspondence. Never fixed-size for primary legal sources.
 - **OpenSearch Serverless vs Aurora pgvector vs Pinecone**: OpenSearch Serverless — native KB pairing, hybrid search, no vendor outside AWS. Aurora pgvector for cost optimization at small scale. Pinecone hard to justify in AWS-native shop.
 - **Bedrock Agents vs AgentCore**: Agents for simple tool use today. AgentCore when needs include cross-session memory, framework portability, policy at tool boundary, long tasks, browser/code execution.
 - **Lambda vs Fargate for API**: Lambda + provisioned concurrency for most paths. Fargate for streaming or sustained high RPS where cold starts hurt UX.
 - **`RetrieveAndGenerate` vs manual `Retrieve` + `InvokeModel`**: RetrieveAndGenerate by default. Manual when you need query rewriting, multi-step reasoning, or custom citation formats.
 - **DynamoDB vs RDS**: DynamoDB for sessions and audit (high-write, key-access, TTL). RDS Postgres for relational metadata and reporting.
 - **CDK vs Terraform**: CDK for AWS-native shops; Terraform if multi-cloud is real. Either is defensible.
+- **MCP servers vs direct API integration**: MCP for any third-party authoritative source (legal research, utility data, payment processors) — gives you one auth chokepoint, one audit chokepoint, one rate-limit chokepoint, and vendor portability. Direct API only for trivial one-off integrations.
+- **Shared service account vs OAuth on-behalf-of for upstream APIs**: on-behalf-of when the upstream provider audits or bills per user (Westlaw, LexisNexis, most enterprise SaaS). Shared service account only for unattributed bulk data (LegiScan, public APIs).
 
 ---
 
