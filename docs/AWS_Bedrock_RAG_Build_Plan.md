@@ -1023,7 +1023,178 @@ Keep Bedrock spend predictable and attributable.
 
 ---
 
+## 13.5) Project Cost Estimates — External APIs and AWS Infrastructure
+
+This section gives concrete numbers for two purposes: (1) sizing the external API spend that comes with the legal-research MCP layer, and (2) sizing the AWS infrastructure cost for both a test/POC environment and a real production deployment. All AWS prices are us-east-1 on-demand rates as of April 2026; all third-party API prices reflect publicly available 2026 list pricing. Negotiated enterprise contracts will differ.
+
+### A) External API pricing (the MCP server upstreams)
+
+These are the costs that flow through the LegiScan, Westlaw, and LexisNexis MCP servers from Section 7.5. They are not AWS costs — they are paid directly to the providers.
+
+#### LegiScan (transparent pricing, easiest to budget)
+- **Public API**: free, capped at 30,000 queries/month. Sufficient for early prototyping and small-scale research, but not for a production legal practice handling many concurrent matters.
+- **Pull API (single state or Congress)**: $2,000/year. Suitable when the firm's practice is concentrated in one jurisdiction.
+- **Push API (full national replication)**: $12,000/year. The right tier for any multi-state practice or any deployment serving partners across jurisdictions. Replicates the entire national legislative database to your own infrastructure, eliminating per-query rate concerns.
+- **GAITS Pro web platform** (non-API, single-state tracking): $100/year. Useful for human users alongside the API, not relevant to the agent.
+
+**Recommendation**: start with the free Public API during development, upgrade to Push API ($12,000/year) when production launches and any multi-state coverage is needed. Plan for $1,000/month of LegiScan in the steady-state production budget.
+
+#### Westlaw (premium, custom contracts)
+- Westlaw does not publish API rates. Access to API datasets and Westlaw CoCounsel/AI-assisted features requires a direct enterprise contract with Thomson Reuters.
+- **Web subscription pricing reference points** (these are the human-seat license rates, useful for benchmarking what API access might run): Westlaw Edge or Westlaw Classic is $78–$133/month per user for single-state coverage; multi-state and federal coverage scales up.
+- **Off-plan ("out-of-plan") document retrieval**: $15–$75 per minute or up to $99 per search. This is where most cost overruns happen — a query that pulls a document outside the plan's coverage triggers per-document pricing. The MCP server's caching policy (Section 7.5) is partly an answer to this risk.
+- **API contract reality**: expect a per-seat annual fee (often $200–$500/seat/month for API-eligible seats) plus per-query fees on certain content types. For a 25-attorney firm with 15 API-eligible seats, budget **$60,000–$150,000/year** as a planning placeholder until the actual quote lands.
+
+**Recommendation**: do not architect around Westlaw API access until the contract and AI addendum are signed. Procurement and legal review take 4–8 weeks. Build the MCP server interface first against a stub, swap in the real API on contract signature.
+
+#### LexisNexis (premium, custom contracts)
+- LexisNexis API access (Nexis Data+) is also custom-quoted, sized on data volume and update frequency.
+- **Web subscription reference points**: Lexis+ individual law firm subscriptions start at roughly $114–$171/month per user for state-level statutes and case law. Lex Machina analytics is typically priced separately.
+- **Out-of-plan reports** (court profiles, Shepard's citations, judge analytics): $7–$99 each. Same caching-policy considerations as Westlaw apply.
+- **API contract reality**: similar profile to Westlaw. For the same 15-seat reference firm, budget **$60,000–$150,000/year** as a planning placeholder.
+
+**Recommendation**: many firms standardize on either Westlaw or LexisNexis (not both) to control cost. The MCP architecture supports either or both, but the contract spend doubles if the firm wants both. The architectural decision is "expose what we license" — if the firm only has Westlaw, the LexisNexis MCP server stays unbuilt.
+
+#### External API total — planning ranges
+- **Minimum viable** (LegiScan free + one of Westlaw/Lexis at small-firm scale): **~$60,000–$80,000/year**.
+- **Mid-size firm** (LegiScan Push + Westlaw OR LexisNexis at 15 seats): **~$80,000–$160,000/year**.
+- **Larger firm** (LegiScan Push + both Westlaw AND LexisNexis at 25–50 seats): **~$200,000–$400,000/year**.
+
+These are dwarfed by what the firm already spends on Westlaw/Lexis seat licenses for human attorneys; the API addendum is incremental on top of seat licensing, not a separate budget. **What matters for the interview is showing you've thought about it, not the exact dollar figure.**
+
+### B) AWS infrastructure — Test/POC environment
+
+A POC environment is sized for: small document corpus (1,000–10,000 documents), 1–3 developers, light usage (~100 queries/day), no redundancy, no high-availability requirements. The goal is to prove the architecture works and produce eval numbers, not to serve real users.
+
+| Service | Configuration | Monthly cost |
+|---|---|---|
+| **Bedrock — Claude Sonnet 4.6** | ~5M input tokens + 1M output tokens/month at $3/$15 per 1M | ~$30 |
+| **Bedrock — Titan embeddings** | ~2M tokens (initial corpus + re-embeds during dev) at $0.02/1M | ~$0.04 |
+| **Bedrock Knowledge Base API calls** | included in token costs above; KB itself is free, you pay for the underlying retrieval and generation | $0 |
+| **OpenSearch Serverless** | dev/test mode, 1 OCU total (0.5 indexing + 0.5 search), no redundancy | ~$175 |
+| **S3** | 50 GB documents + storage class transitions | ~$2 |
+| **Lambda** | <1M invocations/month for ingestion, retrieval, tools | ~$5 |
+| **API Gateway** | <100K requests/month | ~$1 |
+| **DynamoDB** | on-demand, sessions + audit, low traffic | ~$5 |
+| **RDS PostgreSQL** | db.t4g.micro Multi-AZ disabled, 20 GB | ~$25 |
+| **CloudWatch** | logs, metrics, basic dashboards | ~$15 |
+| **Cognito** | <1,000 MAU free tier | $0 |
+| **Secrets Manager** | 5 secrets | ~$2 |
+| **NAT Gateway** | single NAT for outbound | ~$35 |
+| **Data transfer** | minimal in dev | ~$5 |
+| **Bedrock Guardrails** | per-call charge, low volume | ~$5 |
+| **Bedrock Agents (or AgentCore)** | runtime + tool invocations at low volume | ~$25 |
+
+**Test environment subtotal: ~$330/month** (~$3,960/year)
+
+**Caveats and gotchas for POC budgets:**
+- **OpenSearch Serverless minimum is the dominant cost.** Even with zero queries, you pay ~$175/month for the dev/test minimum (or ~$350/month for the redundant production minimum). This catches teams off guard. If you delete the Bedrock Knowledge Base, the underlying OpenSearch Serverless collection is *not* deleted automatically — you have to delete the collection separately or you continue paying the minimum forever. Add a teardown checklist to the runbook.
+- **Token spend during eval runs spikes the bill.** A single eval run on 200 golden Q/A pairs through Sonnet 4.6 with full context can be $5–$15. Daily eval runs in CI add $150–$450/month if you're not careful — use Haiku 4.5 for inner-loop iteration and reserve Sonnet for release-gate evals.
+- **NAT Gateway is 10% of the dev bill.** If outbound internet is rare in dev, consider VPC endpoints for the AWS services you use and skip NAT — but you'll need NAT eventually for MCP servers calling external APIs, so it's worth keeping in.
+- **One-time costs not in the table above**: initial corpus embedding ($10–$50 depending on size), OCR for any scanned documents (Textract is ~$1.50 per 1,000 pages for basic OCR, more for analysis features), engineering time (the dominant real cost — typically $80K–$150K of engineering effort for the MVP, regardless of AWS bill).
+
+### C) AWS infrastructure — Production environment (mid-size deployment)
+
+Production sizing assumes: 100,000–1M documents in the corpus, 50–500 active users, 5,000–50,000 queries/day, multi-AZ redundancy, full observability, eval harness running in CI, and basic agent capabilities. This is the realistic deployment for a mid-size firm or business unit.
+
+| Service | Configuration | Monthly cost |
+|---|---|---|
+| **Bedrock — Claude Sonnet 4.6** (synthesis) | ~500M input tokens + 100M output/month at $3/$15 per 1M | ~$3,000 |
+| **Bedrock — Claude Haiku 4.5** (routing, classification) | ~200M input + 30M output/month at $0.80/$4 per 1M | ~$280 |
+| **Bedrock — Titan embeddings** | ~100M tokens/month (ingestion + re-embeds + query embeddings) at $0.02/1M | ~$2 |
+| **Prompt caching savings** | reduces effective input cost ~30–50% on repeated context | savings of ~$900 |
+| **Bedrock Guardrails** | per-call assessment, all 6 policies | ~$300 |
+| **Bedrock Knowledge Base** | retrieval calls included in underlying token cost; KB itself free | $0 |
+| **Bedrock Agents / AgentCore Runtime** | session runtime, tool invocations | ~$400 |
+| **OpenSearch Serverless** | redundant, 4 OCU baseline scaling to ~8 OCU during peak | ~$1,200 |
+| **S3** | 1 TB documents + lifecycle tiers + Glacier archive | ~$30 |
+| **Lambda** | ingestion, retrieval, tool functions, MCP servers | ~$200 |
+| **Fargate** | Westlaw + LexisNexis MCP servers (2 services × 0.5 vCPU × 1 GB × 24/7) | ~$60 |
+| **API Gateway** | ~5M requests/month | ~$25 |
+| **DynamoDB** | sessions + audit, on-demand, ~5M writes + 20M reads/month | ~$80 |
+| **RDS PostgreSQL** | db.r6g.large Multi-AZ, 100 GB, PITR | ~$450 |
+| **ElastiCache Redis** | cache.t4g.medium for MCP rate-limit and result caching | ~$70 |
+| **CloudWatch** | logs (high volume), metrics, alarms, dashboards | ~$300 |
+| **X-Ray** | distributed tracing | ~$30 |
+| **Cognito** | 5,000 MAU at $0.0055 each above first 50K free | ~$0 (under free tier) |
+| **CloudFront** | static frontend + WAF | ~$50 |
+| **WAF** | managed rule sets + custom rules | ~$30 |
+| **NAT Gateway** | 2 AZ for redundancy + data processing | ~$130 |
+| **Secrets Manager** | ~20 secrets including Westlaw/Lexis tokens | ~$8 |
+| **KMS** | customer-managed keys per data domain | ~$15 |
+| **VPC endpoints** | Bedrock, S3, DynamoDB, STS to keep traffic on AWS network | ~$50 |
+| **Data transfer** | egress to clients, ingress from MCPs | ~$100 |
+| **GuardDuty + Security Hub + Config** | account-wide security baseline | ~$75 |
+| **CloudTrail + log archive S3** | org-wide audit trail | ~$25 |
+| **Backup (AWS Backup)** | RDS + DynamoDB + S3 cross-region | ~$50 |
+
+**Production environment subtotal (gross): ~$6,860/month**
+**With prompt caching savings: ~$5,960/month**
+**Annualized: ~$71,500/year**
+
+### D) Production at scale — order-of-magnitude sensitivity
+
+Production cost scales primarily with **token volume** and secondarily with **OpenSearch capacity at high load**. The other line items grow sub-linearly. Three scaling scenarios:
+
+| Scenario | Daily queries | Monthly token spend (Bedrock) | OpenSearch Serverless | Other infra | **Total monthly** |
+|---|---|---|---|---|---|
+| Light production | ~5,000 | ~$1,500 | ~$700 | ~$1,500 | **~$3,700** |
+| Mid production (table above) | ~25,000 | ~$3,000 | ~$1,200 | ~$1,800 | **~$6,000** |
+| Heavy production | ~100,000 | ~$10,000–$15,000 | ~$2,500 | ~$2,500 | **~$15,000–$20,000** |
+| Enterprise scale | ~500,000+ | $30,000+ (consider Provisioned Throughput) | ~$5,000+ | ~$5,000 | **$40,000+** |
+
+At enterprise scale, **Provisioned Throughput becomes cheaper than on-demand** for predictable token volumes — typically the breakpoint is around $30,000/month of consistent on-demand spend. PT requires capacity planning and 1–6 month commitments, so it's a Phase 4 optimization, not Phase 1.
+
+### E) The full picture — production all-in budget
+
+For a mid-size firm running this system in production with both legal-research MCP integrations:
+
+| Component | Annual cost |
+|---|---|
+| AWS infrastructure (mid production) | ~$72,000 |
+| LegiScan Push API | ~$12,000 |
+| Westlaw API (15-seat reference) | ~$60,000–$150,000 |
+| LexisNexis API (15-seat reference) | ~$60,000–$150,000 |
+| **All-in annual operating cost** | **~$200,000–$385,000** |
+
+The Westlaw + LexisNexis API spend is the dominant line item by a wide margin. The AWS infrastructure cost is roughly 20–35% of total operating cost. **This is the right framing for any CFO conversation**: AWS is not the expensive part of legal RAG. The expensive part is the licensed authoritative content the system grounds against.
+
+### F) Cost-control levers (sized to impact)
+
+The cost-governance tactics from Section 13 have measurable impact at production scale. In rough order of leverage:
+
+1. **Model tiering** — routing simple queries to Haiku/Nova-Lite saves 60–80% of routing-class queries' generation cost. At mid production, this is ~$500/month saved.
+2. **Prompt caching** — 30–50% reduction on repeated context tokens. At mid production, this is ~$900–$1,200/month saved.
+3. **Aggressive context trimming** — capping retrieved context at the smallest amount that maintains eval quality. Cuts both input tokens and latency. ~10–20% input savings if tuned well.
+4. **Provisioned Throughput at scale** — at $30K+/month consistent Bedrock spend, PT can save 20–40%.
+5. **Westlaw/Lexis cache discipline** — within ToS limits, caching KeyCite/Shepard's flags and citation metadata cuts repeated lookups. Mostly a latency win, but at high volume reduces per-query upcharges.
+6. **Eval harness model choice** — running CI evals on Haiku 4.5 instead of Sonnet 4.6 cuts eval bills by ~80%. Use Sonnet only for release-gate full evals.
+7. **OpenSearch Serverless right-sizing** — set max OCU caps per environment so a runaway query can't scale to $5K/day.
+
+### G) Cost monitoring — what to instrument
+
+Per Section 13's cost-governance principles, every dollar should map to a tenant and use case. Production monitoring requires:
+
+- **Tags everywhere**: `Environment`, `Tenant`, `UseCase`, `Component`. Every Lambda, every Bedrock call, every S3 prefix.
+- **AWS Budgets alerts** at 50%, 80%, 100% of monthly budget per tag dimension. Alerts go to Slack and email, not just email.
+- **Per-tenant cost reports** generated weekly. If one tenant drives 60% of cost, that's a contract conversation, not an engineering one.
+- **Per-query cost metric** in the eval harness. Cost regression > 15% is a release-gate warning.
+- **Anomaly detection** on Bedrock token consumption — catches runaway agents (a tool calling itself in a loop, a prompt-injection attack causing context explosion) within hours, not at end-of-month bill review.
+
+### What to mention to Kirti about this section
+
+The cost story has three layers worth communicating clearly:
+1. **Test environment is cheap (~$330/month)**, dominated by the OpenSearch Serverless minimum. Easy to spin up, easy to forget to tear down.
+2. **Mid-production AWS cost (~$6K/month, $72K/year)** is dominated by Bedrock token spend, with OpenSearch Serverless as the second largest line item.
+3. **All-in cost (~$200K–$385K/year for legal use case)** is dominated by external content licensing, not AWS. AWS is the smallest of the three big buckets.
+
+Senior engineers articulate cost in *layers* and *levers*, not just totals. Saying "this will cost about $6K/month for AWS at our expected query volume, with token spend the dominant line item, and prompt caching is the highest-leverage optimization once we have a year of usage data" reads as someone who has actually owned a production budget. Saying "around $72K/year" reads as someone who looked at a calculator once.
+
+---
+
 ## 14) Security & Compliance
+
+
 
 ### Step
 PII handling, encryption, retention, incident response.
