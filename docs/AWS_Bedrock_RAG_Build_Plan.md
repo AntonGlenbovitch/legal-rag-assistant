@@ -1716,51 +1716,141 @@ For an AWS-native shop, CDK is the productive choice. AgentCore now has Terrafor
 
 ---
 
-## 16) Phased Delivery Roadmap
+## 16) Delivery Gates (outcome-based, not time-based)
 
-### Phase 1 (Weeks 1–6): Foundation + DMS pilot + retrieval MVP
-- AWS accounts, VPC, KMS, IAM baseline.
-- **Identity Center** federated to firm IdP; Verified Permissions policy store with initial Cedar policies.
-- **DMS API procurement** initiated (often the long pole — 4–8 weeks).
-- S3 bucket, EventBridge ingestion pipeline.
-- Bedrock KB on OpenSearch Serverless with **multi-modal embeddings** (Titan Multimodal + Titan Text v2).
-- **Document type classifier and structural chunking parsers** for the top 3 case-file types: pleadings (numbered paragraphs), depositions (Q&A with page:line), court orders (per-ruling chunking). Default fallback for the rest.
-- **DMS pilot**: sync 100 closed matters end-to-end, validate access controls round-trip correctly, validate document fidelity, validate re-sync handles updates.
-- Retrieve API behind API Gateway + Identity Center.
-- **ABAC schema and metadata propagation** from DMS to KB chunk metadata.
-- 100-question golden eval set covering structural retrieval cases AND privilege enforcement cases.
+### Why gates instead of phases
 
-### Phase 2 (Weeks 7–12): Multi-modal ingestion + generation + agent + guardrails
-- **Textract OCR** for scanned historical documents.
-- **Transcribe + speaker diarization** for audio/video.
-- **Rekognition Video + vision-LLM captioning** for evidence images and video.
-- Bedrock `Retrieve` + manual orchestration with Claude Sonnet for synthesis and Haiku for routing.
-- **AgentCore Runtime + Identity + Memory + Policy** deployed; case lookup workflow live.
-- Bedrock Guardrails fully configured (all 6 policies, tuned to legal eval set).
-- Prompt-injection defenses in place (especially for hostile discovery content).
-- CloudWatch dashboards, X-Ray tracing across the agent loop.
-- Eval harness in CI; structural tests on every commit, workflow tests on release gate.
+The previous version of this plan organized delivery into time-based phases (Weeks 1–6, 7–12, etc.). For a system carrying malpractice exposure, ToS-binding contracts, and multi-modal cost risk, time-based phasing is the wrong abstraction. It implicitly allows a team to "make progress" on one phase while a foundational dependency in an earlier phase is broken or absent. Gates make this impossible.
 
-### Phase 3 (Weeks 13–18): MCP integrations + case similarity + frontend
-- **MCP server scaffolding** with shared library (auth, rate-limit, cache, resilience, observability, audit).
-- **DMS MCP server live** in production (sync graduated from pilot to full corpus).
-- **LegiScan MCP server** (simplest auth, validates the pattern).
-- **Westlaw and LexisNexis MCP servers** behind AgentCore Gateway with OAuth on-behalf-of, ToS-aware caching policies in writing.
-- **Case similarity workflow live** — finds similar prior matters with outcome metadata.
-- **Multi-stage retrieval orchestration** — case lookup with supporting authority working end-to-end.
-- React frontend on CloudFront with multi-modal viewers (image previews, video deep-links, audio scrubbers).
-- Streaming responses via SSE.
-- Approval workflow for sensitive or billable tools.
+Three principles drive the gate structure:
 
-### Phase 4 (Weeks 19–26): Cold-start drafting + historical backfill + scale optimization
-- **Cold-start drafting workflow live** — generates documents from precedent + authority with citation verification, work-product tagging, approval gates.
-- **Historical backfill** kicks off: OCR, transcription, image processing, embedding the firm's complete historical corpus. Multi-week one-time operation.
-- **Workflow integration test suite** (Section 11 Category 7) at full coverage.
-- Cost optimization (model tiering refined, prompt caching at maximum, PT analysis once volume is known).
-- A/B testing framework.
-- Production drift monitoring.
-- Cross-region DR.
-- Periodic access review process operational; quarterly DMS-to-KB reconciliation reports.
+1. **Progression is conditional on outcomes, not calendar.** A gate doesn't end on a date; it ends when the exit criteria pass. If a criterion fails, the team stops and fixes it before moving forward — even if that costs schedule.
+2. **Dependencies that span legal, commercial, and technical domains are made explicit.** Gate 2 is primarily a procurement and legal dependency gate, not a coding gate. Treating it as a coding gate has caused real projects to ship features that violate ToS while contracts were still being negotiated.
+3. **No gate can be partially passed.** Each gate has predefined hard pass criteria. Failing any criterion blocks progression. This is the rule that gives the structure teeth — without it, gates degrade into time-based phasing under a different name ("we passed Gate 1 except for the AEO exclusion test, but we'll fix it in Gate 2").
+
+Calendar estimates appear in each gate as **not-to-exceed budgets**, not as deadlines. If Gate 1 takes 10 weeks instead of 6, the right response is to slip Gate 2, not to start it early.
+
+### Gate 1: DMS + ABAC + structural chunking (top document types first)
+
+**Why this gate exists**
+
+This gate proves the foundation everything else depends on:
+1. **Canonical data truth** — DMS is the system of record, KB is a derived index. The architecture is internally consistent only if this holds.
+2. **Correct access enforcement** — ABAC for matter teams, ethical walls, privilege flags, AEO, settlement confidentiality, audience designation. Mistakes here are malpractice.
+3. **Retrieval correctness at legal-citation level** — structural chunking for pleadings, depositions, court orders. If the system can't return the exact right chunk with the exact right citation, every layer above it amplifies the error.
+
+If this gate is weak, MCP, multi-modal, and drafting all amplify errors that should have been caught here.
+
+**Scope in Gate 1**
+- AWS foundation (Section 1) operational.
+- Identity Center federated to firm IdP, with Verified Permissions Cedar policy store containing baseline policies (Section 9).
+- DMS API procurement complete; sync pipeline in production against a controlled pilot corpus (~100 closed matters).
+- ABAC attribute schema formalized; metadata propagation from DMS → KB chunk metadata operational.
+- Structural chunkers for top 3 case-file document types: pleadings (numbered paragraphs), depositions (Q&A with page:line preservation), court orders (per-ruling chunking). Default fallback for everything else.
+- Retrieval API behind API Gateway + Identity Center authorizer (Sections 5, 9).
+- Deterministic eval suite running in CI: structural retrieval tests (Section 11 Categories 1–4) plus privilege enforcement tests (Section 11 Category 7 WF-PR-* tests).
+- Sessions and audit infrastructure (Section 8) operational, including the privileged-content audit subtable and engineer-redaction defaults.
+
+**Exit criteria (strict, all must be true)**
+- ✅ **DMS round-trip validation passes** on pilot corpus: document fidelity preserved on sync, re-sync correctly handles updates and deletes, access metadata changes propagate to KB within target SLA (minutes, not hours).
+- ✅ **ABAC enforcement tests pass 100%** on restricted scenarios — conflicted user excluded, AEO chunks filtered for non-attorney users, client-visible filter excludes work product, settlement-confidential matters excluded from cross-matter queries, separation of duties enforced for engineer roles. **No partial pass on this criterion** — any miss is a malpractice precursor.
+- ✅ **Structural retrieval tests pass with exact citation precision**, not "close enough." For depositions: page:line metadata preserved. For pleadings: numbered paragraph metadata preserved. For court orders: per-ruling chunking validated.
+- ✅ **Eval harness operational in CI** with structural and privilege tests gated on every PR touching chunking, KB config, or authorization.
+- ✅ **Audit log can answer "who accessed what, when, under which authorization decision"** end-to-end on the pilot corpus.
+
+**If Gate 1 fails**
+- Do not proceed to Gate 2 (MCP) or Gate 3 (multi-modal). The foundation is unsafe.
+- **Fix in this order**: access control drift first → chunk boundary logic second → metadata mapping third. This order matters because access control drift can mask retrieval bugs (a missing chunk looks like correct authorization), and chunking bugs can mask metadata bugs (a malformed chunk has malformed metadata that looks like a propagation failure).
+- Re-run deterministic tests before LLM-judge scoring. If deterministic tests fail, LLM-judge scoring is meaningless.
+
+**Time budget (not-to-exceed)**: 6–10 weeks, dominated by DMS API procurement and pilot corpus validation. If approaching the upper bound, slip the gate; do not compress validation.
+
+---
+
+### Gate 2: External MCP providers (only after legal contracts + AI addenda)
+
+**Why this gate exists**
+
+This is primarily a legal and commercial dependency gate, not a coding gate. Westlaw and LexisNexis API access requires:
+- Enterprise contracts that take 4–8 weeks to negotiate.
+- AI-specific addenda that explicitly govern how AI agents may use the data — recent ToS updates from both providers prohibit certain training, embedding, and indexing patterns.
+- Per-seat licensing for API-eligible attorneys.
+- Audit and ToS-aware caching policies in writing.
+
+Shipping integrations before contracts are signed is a contractual breach. Code can be ready before the legal work; **what cannot happen is exposing the tools to attorneys before the addenda are signed**.
+
+**Scope in Gate 2**
+- Procurement and legal review completed for Westlaw, LexisNexis, LegiScan (paid tier), and DMS API access.
+- AI-specific addenda signed and on file.
+- ToS-aware caching policies codified in MCP server config and reviewed in writing with provider account reps.
+- OAuth on-behalf-of identity flows verified end-to-end (attorney login → AgentCore Identity → outbound OAuth → upstream API call attributed to the correct seat).
+- MCP shared library (auth, rate-limit, cache, resilience, observability, audit) operational.
+- Provider MCP servers deployed in order: LegiScan first (simplest auth, validates the pattern), Westlaw and LexisNexis second.
+- DMS MCP server graduated from pilot to full corpus.
+- Provider-specific dashboards and audit trails operational.
+- Multi-stage retrieval orchestration (Section 6) live: case lookup workflow with internal retrieval + external authority lookup running end-to-end.
+
+**Exit criteria (strict, all must be true)**
+- ✅ **Signed contract + signed AI addendum on file** for each provider enabled in production. Stub providers in non-prod environments are fine; real providers require paper.
+- ✅ **OAuth on-behalf-of attribution validated** per user and per seat. Test cases: an attorney without a Westlaw seat attempting a Westlaw query gets denied at the Westlaw side, not just at the system layer; a Westlaw call appears in Westlaw's own audit attributed to the correct attorney.
+- ✅ **Caching controls enforced** — no forbidden full-text persistence beyond session, KeyCite/Shepard's flags cached only within the contractually permitted TTL, citation metadata cached within written caching policy.
+- ✅ **Audit can answer "who queried what, when, under which matter"** for every external API call, with the user attribution traceable to a licensed seat.
+- ✅ **End-to-end case-lookup workflow** (Section 11 WF-CL-* tests) passes with citations tracing to real external sources, no fabricated citations.
+- ✅ **Workflow integration tests** (Section 11 Category 7) pass for case lookup and case similarity.
+
+**If Gate 2 fails**
+- Keep internal-only mode active. The system runs on DMS + KB without external authority lookups; case lookup workflow degrades to "here's what we have internally" without supporting CT/federal authority.
+- Stub MCP providers behind the same interface so the agent code path stays exercised, but **do not expose real tools to attorneys** until legal clearance lands.
+- If specific providers clear earlier than others, enable them individually as their addenda are signed. LegiScan typically clears fastest because the ToS is more permissive.
+
+**Time budget (not-to-exceed)**: 6–12 weeks, dominated by procurement. The coding portion typically takes 3–4 weeks; the rest is contracts.
+
+---
+
+### Gate 3: Multi-modal expansion (only after text retrieval is stable)
+
+**Why this gate exists**
+
+Multi-modal processing — OCR via Textract, audio transcription with diarization, video scene segmentation with timestamps, image embeddings, vision-LLM captioning — is expensive and operationally complex. Adding it to an unstable core compounds problems:
+- Retrieval quality degradation is harder to attribute (is this a chunking bug or an OCR confidence bug?).
+- Cost spikes are harder to forecast (Rekognition Video at $0.10/min adds up fast).
+- Privilege enforcement gaps in modality-specific code can leak content that text-only enforcement would have caught.
+
+You add multi-modal only after text retrieval, citations, and privilege controls are consistently passing.
+
+**Scope in Gate 3**
+- Textract OCR for scanned historical documents.
+- Amazon Transcribe with speaker diarization for audio and video tracks.
+- Amazon Rekognition Video for scene segmentation and object/person tracking.
+- Bedrock Titan Multimodal Embeddings for images.
+- Bedrock vision-LLM captioning for narrative image description.
+- Cross-modality retrieval UX (timestamp deep-links, image previews, audio scrubbers).
+- Workflow tests for image, video, and audio evidence queries (Section 11 WF-MM-* tests).
+- **Historical backfill as a controlled program**, not "big bang." Pilot a representative subset (one practice area, ~100 matters), validate quality and cost, then expand systematically.
+- Cold-start drafting workflow live (depends on stable similarity retrieval, which Gate 2 established).
+
+**Exit criteria (strict, all must be true)**
+- ✅ **Baseline text gates remain green after multi-modal is enabled.** Re-run Gate 1 deterministic tests and Gate 2 workflow tests with multi-modal active. If multi-modal addition regressed any text-mode test, fix before continuing.
+- ✅ **Multi-modal workflow tests pass** — timestamp deep-links resolve correctly into the underlying media, speaker diarization correctness verified against ground truth, cross-modal synthesis produces correctly attributed citations across text/image/audio/video.
+- ✅ **Cost and performance within agreed budget thresholds.** Monthly multi-modal AWS spend within the projected range from Section 13.5; per-query latency within SLA; OCR/transcription confidence above threshold floor.
+- ✅ **No regressions in privilege enforcement across modalities.** A privileged image, an AEO-designated video clip, a privileged audio recording — all must enforce the same access controls as a privileged text document. Section 11 WF-PR-* tests re-run with multi-modal content and pass 100%.
+- ✅ **Historical backfill pilot** completed for the representative subset with quality validation and cost-per-document figures matched to the budget.
+
+**If Gate 3 fails**
+- **Roll back multi-modal retrieval weighting** — keep the ingestion artifacts (transcripts, captions, embeddings) but disable their contribution to retrieval results. The system continues in text-first production mode while modality-specific pipeline issues get fixed.
+- Do not proceed with full historical backfill until pilot quality and cost gates clear.
+
+**Time budget (not-to-exceed)**: 6–10 weeks for the multi-modal pipeline itself; historical backfill is a separate controlled program (typically 4–12 weeks of compute time depending on corpus size, run as a background operation while the system serves production).
+
+---
+
+### Practical operating rule (one-line)
+
+**No gate can be partially passed.** Each gate has predefined hard pass criteria covering security, legal, and quality dimensions. Failing any criterion blocks progression to the next gate. The right response to a near-miss is to fix the gap and re-test, not to ship the gap and document it as future work.
+
+### What to mention to Kirti about this section
+
+This is one of the strongest places to demonstrate senior judgment about delivery risk. Most candidates pitch RAG projects as Gantt charts. The takeaway: **for any high-stakes domain (legal, medical, financial), delivery is gated on outcomes, not calendar — and the gates make legal and commercial dependencies first-class blockers, not project-management afterthoughts.** Saying "we'll deliver in three phases over six months" is a tutorial answer. Saying "we have three gates with hard pass criteria; Gate 2 is primarily procurement, not coding, so its timeline is bounded by contracts not engineering velocity, and Gate 3 cannot start until the text-only system is stable because adding multi-modal to an unstable core compounds problems we can't diagnose" is a senior-engineer answer.
 
 ---
 
@@ -1793,5 +1883,6 @@ When Kirti asks "why X over Y," these are the one-line answers:
 3. **Layered defense.** Auth, guardrails, prompt-injection defenses, audit, eval, and rate limits all overlap by design — no single layer is the only thing protecting the system.
 4. **Quality is measurable.** No prompt change, model swap, or chunking tweak ships without passing the eval gate.
 5. **Cost is attributable.** Every dollar maps to a tenant and a use case.
+6. **Delivery is gated on outcomes, not calendar.** Three hard gates (foundation, external integrations, multi-modal) with strict pass criteria. No partial passes. Legal and commercial dependencies are first-class blockers, not project-management afterthoughts.
 
-This is the architecture that gets a customer-grounded AI system to production at enterprise scale on AWS, and it's the one that maps directly onto the Oncourse JD.
+This is the architecture that gets a high-stakes domain-grounded AI system — legal case knowledge, customer-facing claims, regulated content, or any use case where retrieval errors are real-world risk — to production at enterprise scale on AWS, and it's the one that maps directly onto the Oncourse JD.
